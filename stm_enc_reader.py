@@ -14,12 +14,12 @@ from common import is_writable
 
 SERVER_IP = '192.168.10.13'
 SERVER_PORT = 7
-RECV_BUFLEN = 128*12
+RECV_BUFLEN = 128*15
 FILE_LEN = 1000000 # numbrer of packets per file
 DIR_BASE = Path('.')
 LOCK_PATH = Path('./el_enc.lock')
 FNAME_FORMAT = 'el_%Y-%m%d-%H%M%S+0000.dat'
-VERSION = 2021032201
+VERSION = 2021042901
 
 HEADER_TXT = b'''Stimulator encoder data
 Packet format: [HEADER 1][TS_LSB 4][TS_MSB 4][DATA 5][FOOTER 1]
@@ -69,7 +69,8 @@ def path_creator(dirpath, fmt=FNAME_FORMAT):
 
 class StmEncReader:
     '''Class to read elevation data'''
-    def __init__(self, ip_addr=SERVER_IP, port=SERVER_PORT, verbose=False, lockpath=LOCK_PATH):
+    def __init__(self, ip_addr=SERVER_IP, port=SERVER_PORT, verbose=False,
+                 lockpath=LOCK_PATH, path_base=DIR_BASE, file_len=FILE_LEN):
         self._verbose = verbose
         self._connected = False
 
@@ -93,6 +94,15 @@ class StmEncReader:
         self._port = port
         self._client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
+        # For filler
+        self._current_path = None
+        self._path_base = path_base
+        self._file_len = file_len
+        self._res = self._file_len*15
+        self.ts_latest = 0
+        self.state_latest = 0
+
+
     def __del__(self):
         self._eprint('Deleted.')
         self._close()
@@ -112,11 +122,20 @@ class StmEncReader:
             sleep(1)
             self._connected = True
 
+    def connect(self):
+        '''Establish connection to Zybo'''
+        self._connect()
+
     def _close(self):
         if self._connected:
             self._client.close()
         else:
             self._eprint('Already closed.')
+
+    def close(self):
+        '''Close connection to Zybo'''
+        self._close()
+        self._current_path = None
 
     def _tcp_write(self, data):
         if self._connected:
@@ -152,22 +171,8 @@ class StmEncReader:
             self._close()
             self._eprint('Fin.')
 
-    def get_write(self, data_num, path=None):
-        '''Get data and write it to a file
-        Parameters
-        ----------
-        data_num: int
-            Number of packets to read
-        path: pathlib.Path or None, default None
-            Path to the file
-        '''
-        if not self._connected:
-            raise RuntimeError('Not connected.')
-
-        rest = 15*data_num
+    def _write_header(self, path):
         current_time = datetime.datetime.now()
-        if path is None:
-            path = Path('.').joinpath(current_time.strftime(FNAME_FORMAT))
 
         with open(path, 'wb') as file_desc:
             # HEADER
@@ -191,18 +196,80 @@ class StmEncReader:
 
             file_desc.write(header)
 
-            # BODY
+
+    def get_write(self, data_num, path=None):
+        '''Get data and write it to a file
+        Parameters
+        ----------
+        data_num: int
+            Number of packets to read
+        path: pathlib.Path or None, default None
+            Path to the file
+        '''
+        if not self._connected:
+            raise RuntimeError('Not connected.')
+
+        rest = 15*data_num
+        current_time = datetime.datetime.now()
+        if path is None:
+            path = Path('.').joinpath(current_time.strftime(FNAME_FORMAT))
+
+        self._write_header(path)
+
+        with open(path, 'wb') as file_desc:
             while rest > 0:
                 recv_num = RECV_BUFLEN if (rest > RECV_BUFLEN) else rest
                 data = self._client.recv(recv_num)
                 file_desc.write(data)
                 rest = rest - len(data)
 
+    def fill(self):
+        '''Fill current file
+        '''
+        # initialization
+        if self._current_path is None:
+            self._current_path = path_creator(self._path_base)
+            self._write_header(self._current_path)
+            self._res = self._file_len*15
+
+        # body
+        recv_num = RECV_BUFLEN if (self._res > RECV_BUFLEN) else self._res
+        data = self._client.recv(recv_num)
+        self._res -= len(data)
+
+        with open(self._current_path, 'wb') as file_desc:
+            file_desc.write(data)
+
+        if self._res <= 0:
+            self._current_path = None
+
+        # analyzer
+        residue = self._res % 15
+        packet = data[-15:] if residue == 0 else data[-30+residue:-15+residue]
+        header = packet[0]
+        ts_lsb = int.from_bytes(packet[1:5], 'little')
+        ts_msb = int.from_bytes(packet[5:9], 'little')
+        timestamp = ts_lsb + (ts_msb << 32)
+        status = int.from_bytes(packet[9:13], 'little')
+        footer = packet[14]
+        if (header == 0x99) and (footer == 0x66):
+            self.ts_latest = timestamp
+            self.state_latest = status
+
+
 
 def main():
     '''Main function to boot infinite loop'''
     elread = StmEncReader(verbose=True)
-    elread.loop(path=DIR_BASE)
+
+    # Filler loop
+    try:
+        elread.connect()
+        while True:
+            elread.fill()
+            sleep(0.1)
+    except KeyboardInterrupt:
+        print('fin.')
 
 if __name__ == '__main__':
     main()
