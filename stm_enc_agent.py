@@ -30,7 +30,10 @@ class StmEncAgent:
         self.lock = TimeoutLock()
         self.take_data = False
 
-        self.device = StmEncReader(ip_addr=ip, port=port, lockpath=lockpath)
+        self.device = None
+        self.ip = ip
+        self.port = port
+        self.lockpath = lockpath
 
         self.initialized = False
 
@@ -45,6 +48,7 @@ class StmEncAgent:
         '''
         f_sample = params.get('sampling_frequency', 1)
         sleep_time = 1/f_sample - 0.1
+        self.device = StmEncReader(ip_addr=self.ip, port=self.port, lockpath=self.lockpath)
 
         with self.lock.acquire_timeout(timeout=0, job='acq') as acquired:
             if not acquired:
@@ -78,6 +82,9 @@ class StmEncAgent:
                 time.sleep(sleep_time)
 
             self.agent.feeds['stm_enc'].flush_buffer()
+
+        del self.device
+        self.device = None
 
         return True, 'Acquisition exited cleanly.'
 

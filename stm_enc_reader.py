@@ -99,6 +99,7 @@ class StmEncReader:
         self._path_base = path_base
         self._file_len = file_len
         self._res = self._file_len*15
+        self._carry_over = b''
         self.ts_latest = 0
         self.state_latest = 0
 
@@ -237,25 +238,30 @@ class StmEncReader:
         data = self._client.recv(recv_num)
         self._res -= len(data)
 
-        with open(self._current_path, 'wb') as file_desc:
+        with open(self._current_path, 'ab') as file_desc:
             file_desc.write(data)
 
         if self._res <= 0:
             self._current_path = None
 
         # analyzer
-        residue = self._res % 15
-        packet = data[-15:] if residue == 0 else data[-30+residue:-15+residue]
-        header = packet[0]
-        ts_lsb = int.from_bytes(packet[1:5], 'little')
-        ts_msb = int.from_bytes(packet[5:9], 'little')
-        timestamp = ts_lsb + (ts_msb << 32)
-        status = int.from_bytes(packet[9:13], 'little')
-        footer = packet[14]
-        if (header == 0x99) and (footer == 0x66):
-            self.ts_latest = timestamp
-            self.state_latest = status
+        tmpd = self._carry_over + data
+        tmpr = len(tmpd) % 15
+        self._carry_over = tmpd[tmpr:]
 
+        pnum = int(len(tmpd)/15)
+
+        for i in range(pnum):
+            packet = tmpd[15*i:15*(i+1)]
+            header = packet[0]
+            ts_lsb = int.from_bytes(packet[1:5], 'little')
+            ts_msb = int.from_bytes(packet[5:9], 'little')
+            timestamp = ts_lsb + (ts_msb << 32)
+            status = int.from_bytes(packet[9:13], 'little')
+            footer = packet[14]
+            if (header == 0x99) and (footer == 0x66):
+                self.ts_latest = timestamp
+                self.state_latest = status
 
 
 def main():
