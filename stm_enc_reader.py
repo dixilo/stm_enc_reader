@@ -2,6 +2,7 @@
 '''Module to run elevation encoder reader
 '''
 import socket
+import selectors
 import sys
 import datetime
 
@@ -19,13 +20,13 @@ FILE_LEN = 1000000 # numbrer of packets per file
 DIR_BASE = Path('.')
 LOCK_PATH = Path('./el_enc.lock')
 FNAME_FORMAT = 'el_%Y-%m%d-%H%M%S+0000.dat'
-VERSION = 2021042901
+VERSION = 2021080501
 
 HEADER_TXT = b'''Stimulator encoder data
 Packet format: [HEADER 1][TS_LSB 4][TS_MSB 4][DATA 5][FOOTER 1]
-\tENC : HEADER=0x99 FOOTER=0x66
-\t\tDATA=[SEC][MIN][HOUR][DAY 2]
 \tIRIG: HEADER=0x55 FOOTER=0xAA
+\t\tDATA=[SEC][MIN][HOUR][DAY 2]
+\tENC : HEADER=0x99 FOOTER=0x66
 \t\tDATA=[STATE 4][0x00]
 '''
 
@@ -95,7 +96,8 @@ class StmEncReader:
         self._client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
         # For filler
-        self._current_path = None
+        self._sel = selectors.DefaultSelector()
+        self._file_desc = None
         self._path_base = path_base
         self._file_len = file_len
         self._res = self._file_len*15
@@ -120,7 +122,8 @@ class StmEncReader:
             self._eprint('Already connected.')
         else:
             self._client.connect((self._ip_addr, self._port))
-            sleep(1)
+            self._client.setblocking(False)
+            self._sel.register(self._client, selectors.EVENT_READ)
             self._connected = True
 
     def connect(self):
@@ -144,105 +147,55 @@ class StmEncReader:
         else:
             self._eprint('Not connected.')
 
-    def loop(self, length=FILE_LEN, path=None):
-        '''Start infinite loop of measurement
-        Parameters
-        ----------
-        length: int
-            Number of packets to read
-        path: pathlib.Path or None, default None
-            Path to the parent directory.
-        '''
-        if path is not None:
-            path = Path(path)
-            path_checker(path)
-
-        self._eprint('Lets start')
-        self._connect()
-        try:
-            while True:
-                if path is None:
-                    self.get_write(length)
-                else:
-                    self.get_write(length, path_creator(path))
-
-        except KeyboardInterrupt:
-            self._eprint('KeyboardInterrupt.')
-            self._eprint('TCP connection aborted.')
-            self._close()
-            self._eprint('Fin.')
-
-    def _write_header(self, path):
+    def _write_header(self):
         current_time = datetime.datetime.now()
 
-        with open(path, 'wb') as file_desc:
-            # HEADER
-            header = b''
-            header += b'256\n' # 4 bytes, 256 is the length of the header
+        # HEADER
+        header = b''
+        header += b'256\n' # 4 bytes, 256 is the length of the header
 
-            # 4 bytes, version number of the logger software
-            header += VERSION.to_bytes(4, 'little', signed=False)
-            utime = current_time.timestamp()
-            utime_int = int(utime)
+        # 4 bytes, version number of the logger software
+        header += VERSION.to_bytes(4, 'little', signed=False)
+        utime = current_time.timestamp()
+        utime_int = int(utime)
 
-            # 4 bytes, integer part of the current time in unix time
-            header += utime_int.to_bytes(4, 'little', signed=False)
-            # microseconds
-            header += int((utime - utime_int)*1e6).to_bytes(4, 'little', signed=False)
-            header += HEADER_TXT
-            res = 256 - len(header)
-            if res < 0:
-                raise Exception('HEADER TOO LONG')
-            header += b' '*res # adjust header size with white spaces
+        # 4 bytes, integer part of the current time in unix time
+        header += utime_int.to_bytes(4, 'little', signed=False)
+        # microseconds
+        header += int((utime - utime_int)*1e6).to_bytes(4, 'little', signed=False)
+        header += HEADER_TXT
+        res = 256 - len(header)
+        if res < 0:
+            raise Exception('HEADER TOO LONG')
+        header += b' '*res # adjust header size with white spaces
 
-            file_desc.write(header)
+        self._file_desc.write(header)
 
-
-    def get_write(self, data_num, path=None):
-        '''Get data and write it to a file
-        Parameters
-        ----------
-        data_num: int
-            Number of packets to read
-        path: pathlib.Path or None, default None
-            Path to the file
-        '''
-        if not self._connected:
-            raise RuntimeError('Not connected.')
-
-        rest = 15*data_num
-        current_time = datetime.datetime.now()
-        if path is None:
-            path = Path('.').joinpath(current_time.strftime(FNAME_FORMAT))
-
-        self._write_header(path)
-
-        with open(path, 'wb') as file_desc:
-            while rest > 0:
-                recv_num = RECV_BUFLEN if (rest > RECV_BUFLEN) else rest
-                data = self._client.recv(recv_num)
-                file_desc.write(data)
-                rest = rest - len(data)
 
     def fill(self):
         '''Fill current file
         '''
         # initialization
-        if self._current_path is None:
-            self._current_path = path_creator(self._path_base)
-            self._write_header(self._current_path)
+        if self._file_desc is None:
+            path = path_creator(self._path_base)
+            self._file_desc = open(path, 'wb')
+            self._write_header()
             self._res = self._file_len*15
 
         # body
-        recv_num = RECV_BUFLEN if (self._res > RECV_BUFLEN) else self._res
-        data = self._client.recv(recv_num)
-        self._res -= len(data)
+        data = b''
+        while self._sel.select(timeout=0):
+            recv_num = RECV_BUFLEN if (self._res > RECV_BUFLEN) else self._res
+            data += self._client.recv(recv_num)
+            self._res -= len(data)
 
-        with open(self._current_path, 'ab') as file_desc:
-            file_desc.write(data)
+        if not data:
+            return
+
+        self._file_desc.write(data)
 
         if self._res <= 0:
-            self._current_path = None
+            self._file_desc = None
 
         # analyzer
         tmpd = self._carry_over + data
